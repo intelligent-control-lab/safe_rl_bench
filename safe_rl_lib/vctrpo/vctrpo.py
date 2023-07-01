@@ -403,8 +403,8 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # print("eta_max: ", eta_max)
         # estimate J²(π')
         mean_surr_ = mean_surr + val[start_idx].mean()
-        # print("mean_surr_: ", mean_surr_)
-        min_J_square = (min(max(0, (mean_surr_-bias_).item()),(mean_surr_+bias_).item()))**2
+        print("mean_surr_: ", mean_surr_)
+        min_J_square = mean_surr_**2
         print("min_J_square: ", min_J_square)
         # variance mean function surrogate
         tmp_3 = abs(torch.cat((val[start_idx], val[start_idx])))
@@ -415,7 +415,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # loss 
         loss_pi = -(mean_surr - k*(mean_var_surr + var_mean_surr))
         
-        print("[Object] ", -loss_pi)
+        # print("[Object] ", -loss_pi)
         
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
