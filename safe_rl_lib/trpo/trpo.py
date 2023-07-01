@@ -318,6 +318,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # loss_pi = -(logp * adv).mean()
         ratio = torch.exp(logp - logp_old)
         loss_pi = -(ratio * adv).mean()
+        print("[Objective Loss] ", -loss_pi)
         
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
