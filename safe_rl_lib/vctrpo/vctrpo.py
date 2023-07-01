@@ -380,15 +380,11 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # compute the H_max
         bias = 4*(1+gamma)*gamma*kl_div*epsilon/(1-gamma)**2
         # print("bias: ", bias)
-        margin_sub = abs(L-bias)
-        margin_add = abs(L+bias)
-        H_max = torch.cat((margin_sub, margin_add))
+        H_max = abs(L) + bias
         # print("H_max: ", H_max)
         # mean variance function surrogate
         tmp_1 = (ratio[start_idx]-1)*adv[start_idx]**2
-        tmp_1 = torch.cat((tmp_1, tmp_1))
         tmp_2 = 2*ratio[start_idx]*adv[start_idx]
-        tmp_2 = torch.cat((tmp_2, tmp_2))
         omage_diff = max(abs(tmp_1 + tmp_2*H_max + H_max**2))
         mean_var_surr = norm_mu_0*omage_diff / (1-gamma**2)
         # print("mean_var_surr: ", mean_var_surr)
@@ -403,9 +399,9 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # print("eta_max: ", eta_max)
         # estimate J²(π')
         mean_surr_ = mean_surr + val[start_idx].mean()
-        print("mean_surr_: ", mean_surr_)
+        # print("mean_surr_: ", mean_surr_)
         min_J_square = mean_surr_**2
-        print("min_J_square: ", min_J_square)
+        # print("min_J_square: ", min_J_square)
         # variance mean function surrogate
         tmp_3 = abs(torch.cat((val[start_idx], val[start_idx])))
         V_square_diff = max(abs(eta_max**2 + 2*tmp_3*eta_max))
