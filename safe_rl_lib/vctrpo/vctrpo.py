@@ -392,9 +392,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # maximum eta ratio:
         L_ = disc_adv[start_idx]
         bias_ = bias/(1+gamma)
-        margin_sub_ = abs(L_-bias_)
-        margin_add_ = abs(L_+bias_)
-        eta_max = torch.cat((margin_sub, margin_add))
+        eta_max = abs(L_) + bias_
         # print("bias_: ", bias_)
         # print("eta_max: ", eta_max)
         # estimate J²(π')
@@ -403,7 +401,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         min_J_square = mean_surr_**2
         # print("min_J_square: ", min_J_square)
         # variance mean function surrogate
-        tmp_3 = abs(torch.cat((val[start_idx], val[start_idx])))
+        tmp_3 = val[start_idx]
         V_square_diff = max(abs(eta_max**2 + 2*tmp_3*eta_max))
         var_mean_surr = norm_mu_0*V_square_diff - min_J_square
         # print("var_mean_surr: ", var_mean_surr)
