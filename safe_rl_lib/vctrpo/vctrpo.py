@@ -6,7 +6,7 @@ from torch.optim import Adam
 import gym
 import time
 import copy
-import trpo_core as core
+import vctrpo_core as core
 from utils.logx import EpochLogger, setup_logger_kwargs, colorize
 from utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs, mpi_sum
@@ -27,6 +27,7 @@ class TRPOBuffer:
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.discounted_adv_buf = np.zeros(size, dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -34,6 +35,7 @@ class TRPOBuffer:
         self.logp_buf = np.zeros(size, dtype=np.float32)
         self.mu_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.logstd_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.start_idx_buf = []
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
@@ -73,10 +75,15 @@ class TRPOBuffer:
         
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+        self.discounted_adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+        
+        #advantage of every (s, a) pair
+        self.adv_buf[path_slice] = deltas
         
         # the next line computes rewards-to-go, to be targets for the value function
         self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
+        
+        self.start_idx_buf.append(self.path_start_idx)
         
         self.path_start_idx = self.ptr
 
@@ -89,15 +96,21 @@ class TRPOBuffer:
         assert self.ptr == self.max_size    # buffer has to be full before you can get
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        adv_mean, adv_std = mpi_statistics_scalar(self.discounted_adv_buf)
+        self.discounted_adv_buf = (self.discounted_adv_buf - adv_mean) / adv_std
+        diff = np.diff(np.array(self.start_idx_buf))
+        to_delete = np.concatenate((diff == 1, [True if self.start_idx_buf[-1]+1==self.max_size else False]))
+        final_start_idx_buf = np.delete(np.array(self.start_idx_buf), np.where(to_delete))
         data = dict(obs=torch.FloatTensor(self.obs_buf).to(device), 
                     act=torch.FloatTensor(self.act_buf).to(device), 
                     ret=torch.FloatTensor(self.ret_buf).to(device),
+                    disc_adv=torch.FloatTensor(self.discounted_adv_buf).to(device), 
                     adv=torch.FloatTensor(self.adv_buf).to(device), 
                     logp=torch.FloatTensor(self.logp_buf).to(device),
                     mu=torch.FloatTensor(self.mu_buf).to(device),
                     logstd=torch.FloatTensor(self.logstd_buf).to(device),
+                    start_idx=torch.tensor(final_start_idx_buf, dtype=torch.long).to(device),
+                    val=torch.FloatTensor(self.val_buf).to(device),
         )
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
 
@@ -294,7 +307,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         """
         Return the sample average KL divergence between old and new policies
         """
-        obs, act, adv, logp_old, mu_old, logstd_old = data['obs'], data['act'], data['adv'], data['logp'], data['mu'], data['logstd']
+        obs, act, adv, logp_old, mu_old, logstd_old = data['obs'], data['act'], data['disc_adv'], data['logp'], data['mu'], data['logstd']
         
         # Average KL Divergence  
         pi, logp = cur_pi(obs, act)
@@ -311,7 +324,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     #     """
     #     The reward objective for TRPO (TRPO policy loss)
     #     """
-    #     obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
+    #     obs, act, adv, logp_old = data['obs'], data['act'], data['disc_adv'], data['logp']
         
     #     # Policy loss 
     #     pi, logp = cur_pi(obs, act)
@@ -334,28 +347,75 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         Args:
             k(float): the probability parameter 
         """
-        obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
-        
+        obs, act, disc_adv, adv, logp_old, mu, start_idx, val = data['obs'], data['act'], data['disc_adv'], data['adv'], data['logp'], data['mu'], data['start_idx'].type(torch.long), data['val']
+        # print("=========================================")
+        # print("adv: ", adv[0:1000])
+        # print("V: ", val[start_idx])
         # Policy loss 
         pi, logp = cur_pi(obs, act)
-        # loss_pi = -(logp * adv).mean()
         ratio = torch.exp(logp - logp_old)
+        # print("ratio: ", ratio[start_idx])
         
         # mean function surrogate 
-        mean_surr = (ratio * adv).mean()
+        mean_surr = (ratio*disc_adv).mean()
+        # print("mean_surr: ", mean_surr)
+
+        # infty norm of mu_0 (choose the mu_0 of the first trajectory)
+        norm_mu_0 = torch.norm(mu[0], p=np.inf)
+        # print("norm_mu_0: ", norm_mu_0)
         
-        # maximum H ratio 
-        # TODO: L(s,a,s') estimate 
-        # TODO: compute the KL related offset 
-        # TODO: estimate the epsilon, max_{s,a}A 
-        # TODO: compute the H_max 
-        H_max = 0
+        # maximum H ratio:
+        # L(s,a,s') estimate ( L=γA(s')-A(s)-γE[A(s_1)] )
+        mean_A_s1 = adv[start_idx+1].mean() #number
+        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
+        L = gammaA1_sub_A0 - mean_A_s1*gamma
+        # print("mean_A_s1:", mean_A_s1)
+        # print("L: ",L)
+        # compute the KL related offset (substitute max DKL with expectation of DKL)
+        kl_div = abs((logp_old - logp).mean().item())
+        # print("kl_div: ",kl_div)
+        # estimate the epsilon, max_{s,a}A
+        epsilon = max(disc_adv)
+        # print("epsilon: ", epsilon)
+        # compute the H_max
+        bias = 4*(1+gamma)*gamma*kl_div*epsilon/(1-gamma)**2
+        # print("bias: ", bias)
+        margin_sub = abs(L-bias)
+        margin_add = abs(L+bias)
+        H_max = torch.cat((margin_sub, margin_add))
+        # print("H_max: ", H_max)
+        # mean variance function surrogate
+        tmp_1 = (ratio[start_idx]-1)*adv[start_idx]**2
+        tmp_1 = torch.cat((tmp_1, tmp_1))
+        tmp_2 = 2*ratio[start_idx]*adv[start_idx]
+        tmp_2 = torch.cat((tmp_2, tmp_2))
+        omage_diff = max(abs(tmp_1 + tmp_2*H_max + H_max**2))
+        mean_var_surr = norm_mu_0*omage_diff / (1-gamma**2)
+        # print("mean_var_surr: ", mean_var_surr)
         
-        # variance function surrogate 
-        var_surr = ((ratio - 1) * adv**2).mean() + (2 * ratio * adv).mean() * H_max 
+        # maximum eta ratio:
+        L_ = disc_adv[start_idx]
+        bias_ = bias/(1+gamma)
+        margin_sub_ = abs(L_-bias_)
+        margin_add_ = abs(L_+bias_)
+        eta_max = torch.cat((margin_sub, margin_add))
+        # print("bias_: ", bias_)
+        # print("eta_max: ", eta_max)
+        # estimate J²(π')
+        mean_surr_ = mean_surr + val[start_idx].mean()
+        # print("mean_surr_: ", mean_surr_)
+        min_J_square = (min(max(0, (mean_surr_-bias_).item()),(mean_surr_+bias_).item()))**2
+        print("min_J_square: ", min_J_square)
+        # variance mean function surrogate
+        tmp_3 = abs(torch.cat((val[start_idx], val[start_idx])))
+        V_square_diff = max(abs(eta_max**2 + 2*tmp_3*eta_max))
+        var_mean_surr = norm_mu_0*V_square_diff - min_J_square
+        # print("var_mean_surr: ", var_mean_surr)
         
         # loss 
-        loss_pi = -(mean_surr - k*var_surr).mean()
+        loss_pi = -(mean_surr - k*(mean_var_surr + var_mean_surr))
+        
+        print("[Object] ", -loss_pi)
         
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -449,7 +509,6 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         except:
             print('reset environment is wrong, try next reset')
     ep_cost, cum_cost = 0, 0
-
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
