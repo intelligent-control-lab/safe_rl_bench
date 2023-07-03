@@ -378,6 +378,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 import ipdb; ipdb.set_trace()
             
             if (kl.item() <= target_kl and pi_l_new.item() <= pi_l_old):
+                print(pi_l_new.item(), pi_l_old)
                 print(colorize(f'Accepting new params at step %d of line search.'%j, 'green', bold=False))
                 # update the policy parameter 
                 new_param = get_net_param_np_vec(ac.pi) - backtrack_coeff**j * x_direction

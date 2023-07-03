@@ -167,7 +167,8 @@ def auto_hession_x(objective, net, x):
 def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10, backtrack_coeff=0.8, backtrack_iters=100, model_save=False):
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10, backtrack_coeff=0.8, backtrack_iters=100, model_save=False, 
+        k = 10., omega=0.05):
     """
     Trust Region Policy Optimization (by clipping), 
  
@@ -340,7 +341,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     #     return loss_pi, pi_info
     
     
-    def compute_loss_pi_Chebyshev(data, cur_pi, k = 10.):
+    def compute_loss_pi_Chebyshev(data, cur_pi):
         """
         The reward objective VCTRPO (VCTRPO policy loss)
         
@@ -348,68 +349,35 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             k(float): the probability parameter 
         """
         obs, act, disc_adv, adv, logp_old, mu, start_idx, val = data['obs'], data['act'], data['disc_adv'], data['adv'], data['logp'], data['mu'], data['start_idx'].type(torch.long), data['val']
-        # print("=========================================")
-        # print("adv: ", adv[0:1000])
-        # print("V: ", val[start_idx])
         # Policy loss 
         pi, logp = cur_pi(obs, act)
         ratio = torch.exp(logp - logp_old)
-        # print("ratio: ", ratio[start_idx])
         
         # mean function surrogate 
         mean_surr = (ratio*disc_adv).mean()
-        # print("mean_surr: ", mean_surr)
+        print("mean_surr: ", mean_surr)
 
         # infty norm of mu_0 (choose the mu_0 of the first trajectory)
         norm_mu_0 = torch.norm(mu[0], p=np.inf)
-        # print("norm_mu_0: ", norm_mu_0)
         
-        # maximum H ratio:
-        # L(s,a,s') estimate ( L=γA(s')-A(s)-γE[A(s_1)] )
-        mean_A_s1 = adv[start_idx+1].mean() #number
-        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
-        L = gammaA1_sub_A0 - mean_A_s1*gamma
-        # print("mean_A_s1:", mean_A_s1)
-        # print("L: ",L)
-        # compute the KL related offset (substitute max DKL with expectation of DKL)
-        kl_div = abs((logp_old - logp).mean().item())
-        # print("kl_div: ",kl_div)
-        # estimate the epsilon, max_{s,a}A
-        epsilon = max(disc_adv)
-        # print("epsilon: ", epsilon)
-        # compute the H_max
-        bias = 4*(1+gamma)*gamma*kl_div*epsilon/(1-gamma)**2
-        # print("bias: ", bias)
-        H_max = abs(L) + bias
-        # print("H_max: ", H_max)
         # mean variance function surrogate
         tmp_1 = (ratio[start_idx]-1)*adv[start_idx]**2
         tmp_2 = 2*ratio[start_idx]*adv[start_idx]
-        omage_diff = max(abs(tmp_1 + tmp_2*H_max + H_max**2))
-        mean_var_surr = norm_mu_0*omage_diff / (1-gamma**2)
-        # print("mean_var_surr: ", mean_var_surr)
+        mean_var_surr = 0.5 * max(tmp_1+tmp_2*omega)
+        print("mean_var_surr: ", mean_var_surr)
         
-        # maximum eta ratio:
-        L_ = disc_adv[start_idx]
-        bias_ = bias/(1+gamma)
-        eta_max = abs(L_) + bias_
-        # print("bias_: ", bias_)
-        # print("eta_max: ", eta_max)
         # estimate J²(π')
         mean_surr_ = mean_surr + val[start_idx].mean()
-        # print("mean_surr_: ", mean_surr_)
-        min_J_square = mean_surr_**2
-        # print("min_J_square: ", min_J_square)
-        # variance mean function surrogate
-        tmp_3 = val[start_idx]
-        V_square_diff = max(abs(eta_max**2 + 2*tmp_3*eta_max))
-        var_mean_surr = norm_mu_0*V_square_diff - min_J_square
-        # print("var_mean_surr: ", var_mean_surr)
+        flag = -1 if mean_surr_ < 0 else 1
+        min_J_square = flag * mean_surr_**2
+        var_mean_surr = -min_J_square
+        print("var_mean_surr: ",var_mean_surr.item())
+        print("V:",val[start_idx].mean().item())
         
         # loss 
         loss_pi = -(mean_surr - k*(mean_var_surr + var_mean_surr))
         
-        # print("[Object] ", -loss_pi)
+        print("[Object] ", -loss_pi)
         
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -468,6 +436,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 import ipdb; ipdb.set_trace()
             
             if (kl.item() <= target_kl and pi_l_new.item() <= pi_l_old):
+                print(pi_l_new.item(), pi_l_old)
                 print(colorize(f'Accepting new params at step %d of line search.'%j, 'green', bold=False))
                 # update the policy parameter 
                 new_param = get_net_param_np_vec(ac.pi) - backtrack_coeff**j * x_direction
@@ -601,12 +570,12 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=1)
-    parser.add_argument('--steps', type=int, default=30000)
+    parser.add_argument('--steps', type=int, default=50000)
     parser.add_argument('--max_ep_len', type=int, default=1000)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--exp_name', type=str, default='trpo')
     parser.add_argument('--model_save', action='store_true')
-    parser.add_argument('--target_kl', type=float, default=0.02)
+    parser.add_argument('--target_kl', type=float, default=0.01)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
