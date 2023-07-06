@@ -168,7 +168,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.01, logger_kwargs=dict(), save_freq=10, backtrack_coeff=0.8, backtrack_iters=100, model_save=False, 
-        k = 10., omega=0.05):
+        k = 10.):
     """
     Trust Region Policy Optimization (by clipping), 
  
@@ -356,14 +356,11 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # mean function surrogate 
         mean_surr = (ratio*disc_adv).mean()
         print("mean_surr: ", mean_surr)
-
-        # infty norm of mu_0 (choose the mu_0 of the first trajectory)
-        norm_mu_0 = torch.norm(mu[0], p=np.inf)
         
         # mean variance function surrogate
         tmp_1 = (ratio[start_idx]-1)*adv[start_idx]**2
         tmp_2 = 2*ratio[start_idx]*adv[start_idx]
-        mean_var_surr = 0.5 * max(tmp_1+tmp_2*omega)
+        mean_var_surr = 0.5 * abs(tmp_1+tmp_2*0.04).mean()
         print("mean_var_surr: ", mean_var_surr)
         
         # estimate J²(π')
@@ -384,7 +381,19 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         ent = pi.entropy().mean().item()
         pi_info = dict(kl=approx_kl, ent=ent)
         
-        return loss_pi, pi_info
+        # infty norm of mu_0 (choose the mu_0 of the first trajectory)
+        norm_mu_0 = torch.norm(mu[0], p=np.inf)
+        
+        # compute L(s,a,s')
+        mean_A_s1 = adv[start_idx+1].mean() #number
+        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
+        L = gammaA1_sub_A0 - mean_A_s1*gamma
+        
+        real_mean_var_surr = norm_mu_0 * max(abs(tmp_1+tmp_2*abs(L))) / (1-gamma**2)
+        cheb_surr = mean_surr - k*(real_mean_var_surr + var_mean_surr)
+        print("cheb_surr: ", cheb_surr)
+        
+        return loss_pi, pi_info, cheb_surr
 
     # Set up function for computing value loss
     def compute_loss_v(data):
@@ -401,13 +410,13 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def update():
         data = buf.get()
 
-        pi_l_old, pi_info_old = compute_loss_pi_Chebyshev(data, ac.pi)
+        pi_l_old, pi_info_old, pi_cheb_old = compute_loss_pi_Chebyshev(data, ac.pi)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
 
         # TRPO policy update core impelmentation 
-        loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi)
+        loss_pi, pi_info, _ = compute_loss_pi_Chebyshev(data, ac.pi)
         g = auto_grad(loss_pi, ac.pi) # get the flatten gradient evaluted at pi old 
         kl_div = compute_kl_pi(data, ac.pi)
         Hx = lambda x: auto_hession_x(kl_div, ac.pi, torch.FloatTensor(x).to(device))
@@ -424,24 +433,24 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             new_param = get_net_param_np_vec(ac.pi) - step * x_direction
             assign_net_param_from_flat(new_param, actor_tmp)
             kl = compute_kl_pi(data, actor_tmp)
-            pi_l, _ = compute_loss_pi_Chebyshev(data, actor_tmp)
+            _, _, pi_cheb = compute_loss_pi_Chebyshev(data, actor_tmp)
             
-            return kl, pi_l
+            return kl, pi_cheb
         
         # update the policy such that the KL diveragence constraints are satisfied and loss is decreasing
         for j in range(backtrack_iters):
             try:
-                kl, pi_l_new = set_and_eval(backtrack_coeff**j)
+                kl, pi_cheb_new = set_and_eval(backtrack_coeff**j)
             except:
                 import ipdb; ipdb.set_trace()
             
-            if (kl.item() <= target_kl and pi_l_new.item() <= pi_l_old):
-                print(pi_l_new.item(), pi_l_old)
+            if (kl.item() <= target_kl and pi_cheb_new.item() >= pi_cheb_old):
+                print(pi_cheb_new.item(), pi_cheb_old.item())
                 print(colorize(f'Accepting new params at step %d of line search.'%j, 'green', bold=False))
                 # update the policy parameter 
                 new_param = get_net_param_np_vec(ac.pi) - backtrack_coeff**j * x_direction
                 assign_net_param_from_flat(new_param, ac.pi)
-                loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
+                loss_pi, pi_info, pi_cheb = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
                 break
             if j==backtrack_iters-1:
                 print(colorize(f'Line search failed! Keeping old params.', 'yellow', bold=False))
@@ -570,12 +579,12 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=1)
-    parser.add_argument('--steps', type=int, default=50000)
+    parser.add_argument('--steps', type=int, default=30000)
     parser.add_argument('--max_ep_len', type=int, default=1000)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--exp_name', type=str, default='trpo')
     parser.add_argument('--model_save', action='store_true')
-    parser.add_argument('--target_kl', type=float, default=0.01)
+    parser.add_argument('--target_kl', type=float, default=0.02)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
