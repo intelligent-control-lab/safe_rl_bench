@@ -10,7 +10,7 @@ import vctrpo_core as core
 from utils.logx import EpochLogger, setup_logger_kwargs, colorize
 from utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs, mpi_sum
-from  safe_rl_envs.envs.engine import Engine as  safe_rl_envs_Engine
+from safe_rl_envs.envs.engine import Engine as  safe_rl_envs_Engine
 from utils.safe_rl_env_config import configuration
 import os.path as osp
 
@@ -24,7 +24,7 @@ class TRPOBuffer:
     for calculating the advantages of state-action pairs.
     """
 
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95, act_n=1):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.discounted_adv_buf = np.zeros(size, dtype=np.float32)
@@ -35,11 +35,12 @@ class TRPOBuffer:
         self.logp_buf = np.zeros(size, dtype=np.float32)
         self.mu_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.logstd_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.logits_buf = np.zeros(core.combined_shape(size, act_n), dtype=np.float32)
         self.start_idx_buf = []
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
-    def store(self, obs, act, rew, val, logp, mu, logstd):
+    def store(self, obs, act, rew, val, logp, mu=np.nan, logstd=np.nan, logits=np.nan):
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
@@ -51,6 +52,7 @@ class TRPOBuffer:
         self.logp_buf[self.ptr] = logp
         self.mu_buf[self.ptr] = mu
         self.logstd_buf[self.ptr] = logstd
+        self.logits_buf[self.ptr] = logits
         self.ptr += 1
 
     def finish_path(self, last_val=0):
@@ -109,6 +111,7 @@ class TRPOBuffer:
                     logp=torch.FloatTensor(self.logp_buf).to(device),
                     mu=torch.FloatTensor(self.mu_buf).to(device),
                     logstd=torch.FloatTensor(self.logstd_buf).to(device),
+                    logits=torch.FloatTensor(self.logits_buf).to(device),
                     start_idx=torch.tensor(final_start_idx_buf, dtype=torch.long).to(device),
                     val=torch.FloatTensor(self.val_buf).to(device),
         )
@@ -168,7 +171,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.01, logger_kwargs=dict(), save_freq=10, backtrack_coeff=0.8, backtrack_iters=100, model_save=False, 
-        k = 10.):
+        k=10., omega_1=0.01, omega_2=0.01, atari=None):
     """
     Trust Region Policy Optimization (by clipping), 
  
@@ -271,6 +274,10 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         model_save (bool): If saving model.
 
     """
+    
+    def atari_env_fn(atari_name, version='5'):
+        env_name = 'ALE/' + atari_name + '-v' + version
+        return gymnasium.make(env_name, obs_type="ram")
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
     setup_pytorch_for_mpi()
@@ -285,7 +292,10 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     np.random.seed(seed)
 
     # Instantiate environment
-    env = env_fn()
+    if atari == None:
+        env = env_fn()
+    else:
+        env = atari_env_fn(atari)
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
 
@@ -301,45 +311,31 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
-    buf = TRPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
-
+    if atari == None:
+        buf = TRPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
+    else:
+        buf = TRPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam, env.action_space.n)
 
     def compute_kl_pi(data, cur_pi):
         """
         Return the sample average KL divergence between old and new policies
         """
-        obs, act, adv, logp_old, mu_old, logstd_old = data['obs'], data['act'], data['disc_adv'], data['logp'], data['mu'], data['logstd']
-        
-        # Average KL Divergence  
+        obs, act, adv, logp_old = data['obs'], data['act'], data['disc_adv'], data['logp']
         pi, logp = cur_pi(obs, act)
-        # average_kl = (logp_old - logp).mean()
-        average_kl = cur_pi._d_kl(
-            torch.as_tensor(obs, dtype=torch.float32),
-            torch.as_tensor(mu_old, dtype=torch.float32),
-            torch.as_tensor(logstd_old, dtype=torch.float32), device=device)
+        
+        if atari == None:
+            mu_old, logstd_old =  data['mu'], data['logstd']
+            average_kl = cur_pi._d_kl(
+                torch.as_tensor(obs, dtype=torch.float32),
+                torch.as_tensor(mu_old, dtype=torch.float32),
+                torch.as_tensor(logstd_old, dtype=torch.float32), device=device)
+        else:
+            logits_old = data['logits']
+            average_kl = cur_pi._d_kl(
+                torch.as_tensor(obs, dtype=torch.float32),
+                torch.as_tensor(logits_old, dtype=torch.float32), device=device)
         
         return average_kl
-
-
-    # def compute_loss_pi(data, cur_pi):
-    #     """
-    #     The reward objective for TRPO (TRPO policy loss)
-    #     """
-    #     obs, act, adv, logp_old = data['obs'], data['act'], data['disc_adv'], data['logp']
-        
-    #     # Policy loss 
-    #     pi, logp = cur_pi(obs, act)
-    #     # loss_pi = -(logp * adv).mean()
-    #     ratio = torch.exp(logp - logp_old)
-    #     loss_pi = -(ratio * adv).mean()
-        
-    #     # Useful extra info
-    #     approx_kl = (logp_old - logp).mean().item()
-    #     ent = pi.entropy().mean().item()
-    #     pi_info = dict(kl=approx_kl, ent=ent)
-        
-    #     return loss_pi, pi_info
-    
     
     def compute_loss_pi_Chebyshev(data, cur_pi):
         """
@@ -355,45 +351,45 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         
         # mean function surrogate 
         mean_surr = (ratio*disc_adv).mean()
-        print("mean_surr: ", mean_surr)
+        
+        # L(s,a,s') estimate ( L=γA(s')-A(s)-γE[A(s_1)] )
+        mean_A_s1 = adv[start_idx+1].mean() #number
+        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
+        L = abs(gammaA1_sub_A0 - mean_A_s1*gamma)
         
         # mean variance function surrogate
         tmp_1 = (ratio[start_idx]-1)*adv[start_idx]**2
         tmp_2 = 2*ratio[start_idx]*adv[start_idx]
-        mean_var_surr = 0.5 * abs(tmp_1+tmp_2*0.04).mean()
-        print("mean_var_surr: ", mean_var_surr)
+        mean_var_surr = omega_1 * abs(tmp_1+tmp_2*L+L**2).mean()      ### 
         
         # estimate J²(π')
-        mean_surr_ = mean_surr + val[start_idx].mean()
-        flag = -1 if mean_surr_ < 0 else 1
-        min_J_square = flag * mean_surr_**2
-        var_mean_surr = -min_J_square
-        print("var_mean_surr: ",var_mean_surr.item())
-        print("V:",val[start_idx].mean().item())
+        # mean_surr_ = mean_surr + val[start_idx].mean()
+        # flag = -1 if mean_surr_ < 0 else 1
+        # min_J_square = flag * mean_surr_**2
+        # var_mean_surr = -min_J_square
         
+        # estimate J²(π')
+        min_J_square = mean_surr**2 + 2*val[start_idx].mean()*mean_surr
+        
+        # compute var_mean_surr
+        factor = omega_1 * (1 - gamma**2) / k
+        L_ = abs(disc_adv[start_idx])
+        var_mean_surr =  factor * (L_**2 + 2*L_*val[start_idx]).mean() - min_J_square
+                
         # loss 
-        loss_pi = -(mean_surr - k*(mean_var_surr + var_mean_surr))
-        
-        print("[Object] ", -loss_pi)
+        loss_pi = -(mean_surr - k*(mean_var_surr + var_mean_surr))    ###
+        print("================================================================")
+        print("1", mean_surr.item(), mean_var_surr.item(), var_mean_surr.item())
+        print("2", tmp_1.mean().item(), tmp_2.mean().item(), L.mean().item())
+        print("3", factor, L_.mean().item(), val[start_idx].mean().item())
+        print("4", (var_mean_surr+min_J_square).item(), min_J_square.item())
         
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
         ent = pi.entropy().mean().item()
         pi_info = dict(kl=approx_kl, ent=ent)
         
-        # infty norm of mu_0 (choose the mu_0 of the first trajectory)
-        norm_mu_0 = torch.norm(mu[0], p=np.inf)
-        
-        # compute L(s,a,s')
-        mean_A_s1 = adv[start_idx+1].mean() #number
-        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
-        L = gammaA1_sub_A0 - mean_A_s1*gamma
-        
-        real_mean_var_surr = norm_mu_0 * max(abs(tmp_1+tmp_2*abs(L))) / (1-gamma**2)
-        cheb_surr = mean_surr - k*(real_mean_var_surr + var_mean_surr)
-        print("cheb_surr: ", cheb_surr)
-        
-        return loss_pi, pi_info, cheb_surr
+        return loss_pi, pi_info
 
     # Set up function for computing value loss
     def compute_loss_v(data):
@@ -410,13 +406,13 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def update():
         data = buf.get()
 
-        pi_l_old, pi_info_old, pi_cheb_old = compute_loss_pi_Chebyshev(data, ac.pi)
+        pi_l_old, pi_info_old = compute_loss_pi_Chebyshev(data, ac.pi)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
 
         # TRPO policy update core impelmentation 
-        loss_pi, pi_info, _ = compute_loss_pi_Chebyshev(data, ac.pi)
+        loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi)
         g = auto_grad(loss_pi, ac.pi) # get the flatten gradient evaluted at pi old 
         kl_div = compute_kl_pi(data, ac.pi)
         Hx = lambda x: auto_hession_x(kl_div, ac.pi, torch.FloatTensor(x).to(device))
@@ -424,7 +420,7 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         
         s = x_hat.T @ Hx(x_hat)
         s_ep = s if s < 0. else 1 # log s negative appearence 
-            
+        
         x_direction = np.sqrt(2 * target_kl / (s+EPS)) * x_hat
         
         # copy an actor to conduct line search 
@@ -433,24 +429,20 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             new_param = get_net_param_np_vec(ac.pi) - step * x_direction
             assign_net_param_from_flat(new_param, actor_tmp)
             kl = compute_kl_pi(data, actor_tmp)
-            _, _, pi_cheb = compute_loss_pi_Chebyshev(data, actor_tmp)
+            pi_l, _ = compute_loss_pi_Chebyshev(data, actor_tmp)
             
-            return kl, pi_cheb
+            return kl, pi_l
         
         # update the policy such that the KL diveragence constraints are satisfied and loss is decreasing
         for j in range(backtrack_iters):
-            try:
-                kl, pi_cheb_new = set_and_eval(backtrack_coeff**j)
-            except:
-                import ipdb; ipdb.set_trace()
+            kl, pi_l_new = set_and_eval(backtrack_coeff**j)
             
-            if (kl.item() <= target_kl and pi_cheb_new.item() >= pi_cheb_old):
-                print(pi_cheb_new.item(), pi_cheb_old.item())
+            if (kl.item() <= target_kl and pi_l_new.item() <= pi_l_old):
                 print(colorize(f'Accepting new params at step %d of line search.'%j, 'green', bold=False))
                 # update the policy parameter 
                 new_param = get_net_param_np_vec(ac.pi) - backtrack_coeff**j * x_direction
                 assign_net_param_from_flat(new_param, ac.pi)
-                loss_pi, pi_info, pi_cheb = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
+                loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
                 break
             if j==backtrack_iters-1:
                 print(colorize(f'Line search failed! Keeping old params.', 'yellow', bold=False))
@@ -484,25 +476,44 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v, logp, mu, logstd = ac.step(torch.as_tensor(o, dtype=torch.float32))
-                    
-            try: 
-                next_o, r, d, info = env.step(a)
-                assert 'cost' in info.keys()
+            if isinstance(o, tuple):
+                o = o[0]
+            if atari == None:
+                a, v, logp, mu, logstd = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            else:
+                a, v, logp, logits = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            
+            try:
+                if atari == None:
+                    next_o, r, d, info = env.step(a)
+                else:
+                    next_o, r, d_1, d_2, info = env.step(a)
+                    d = d_1 and d_2
+                if atari == None:
+                    assert 'cost' in info.keys()
             except: 
+                print(f"simulation exception discovered, discard this episode")
                 # simulation exception discovered, discard this episode 
                 next_o, r, d = o, 0, True # observation will not change, no reward when episode done 
-                info['cost'] = 0 # no cost when episode done 
+                if atari == None:
+                    info['cost'] = 0 # no cost when episode done 
             
+            if atari == None:
             # Track cumulative cost over training
-            cum_cost += info['cost']
+                cum_cost += info['cost']
             
             ep_ret += r
             ep_len += 1
-            ep_cost += info['cost']
+            if atari == None:
+                ep_cost += info['cost']
 
             # save and log
-            buf.store(o, a, r, v, logp, mu, logstd)
+            if isinstance(o, tuple):
+                o = o[0]
+            if atari == None:
+                buf.store(o, a, r, v, logp, mu=mu, logstd=logstd)
+            else:
+                buf.store(o, a, r, v, logp, logits=logits)
             logger.store(VVals=v)
             
             # Update obs (critical!)
@@ -517,7 +528,12 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _, _, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    if isinstance(o, tuple):
+                        o = o[0]
+                    if atari == None:
+                        _, v, _, _, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    else:
+                        _, v, _, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
                 else:
                     v = 0
                 buf.finish_path(v)
@@ -578,19 +594,28 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--name', '-n', type=int)
     parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--steps', type=int, default=30000)
-    parser.add_argument('--max_ep_len', type=int, default=1000)
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--exp_name', type=str, default='trpo')
+    parser.add_argument('--max_ep_len', type=int, default=250)
+    parser.add_argument('--epochs', type=int, default=300)          ###
+    parser.add_argument('--exp_name', type=str, default='vctrpo')
     parser.add_argument('--model_save', action='store_true')
-    parser.add_argument('--target_kl', type=float, default=0.02)
+    parser.add_argument('--target_kl', type=float, default=0.02)    ###
+    parser.add_argument('--omega1', type=float, default=0.05)       ###
+    parser.add_argument('--omega2', type=float, default=0)          ###
+    parser.add_argument('--k', '-k', type=float, default=10.)       ###
+    parser.add_argument('--atari_name', '-a', type=str, default=None, choices=['Pong', 'Seaquest', 'Riverraid', 'Freeway', 'BeamRider', 'Gopher', 'SpaceInvaders'])
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
     
-    exp_name = args.task + '_' + args.exp_name + '_' + 'kl' + str(args.target_kl) + '_' + 'epochs' + str(args.epochs)
-    logger_kwargs = setup_logger_kwargs(exp_name, args.seed)
+    if args.atari_name == None:
+        exp_name = args.task + '_' + args.exp_name + '_' + 'kl' + str(args.target_kl) + '_' + 'epochs' + str(args.epochs)
+    else:
+        import gymnasium
+        exp_name = args.atari_name + '_' + args.exp_name + '_' + 'kl' + str(args.target_kl) + '_' + 'epochs' + str(args.epochs)
+    logger_kwargs = setup_logger_kwargs(exp_name, args.name)
 
     # whether to save model
     model_save = True if args.model_save else False
@@ -598,4 +623,5 @@ if __name__ == '__main__':
     trpo(lambda : create_env(args), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
-        logger_kwargs=logger_kwargs, model_save=model_save, target_kl=args.target_kl, max_ep_len=args.max_ep_len)
+        logger_kwargs=logger_kwargs, model_save=model_save, target_kl=args.target_kl, max_ep_len=args.max_ep_len,
+        k=args.k, omega_1=args.omega1, omega_2=args.omega2, atari=args.atari_name)
