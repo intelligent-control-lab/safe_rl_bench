@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.signal
-from gym.spaces import Box, Discrete
+from gym.spaces import Box
+from gymnasium.spaces import Discrete
 
 import torch
 import torch.nn as nn
@@ -86,14 +87,24 @@ class MLPCategoricalActor(Actor):
         self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
 
     def _distribution(self, obs):
+        # if len(obs.shape) == 1:
+        #     normalized_obs = torch.clamp((obs - obs.mean()) / obs.std(), -5.0, 5.0)
+        # else:
+        #     normalized_obs = torch.clamp((obs - obs.mean(axis=1)[:,None]) / obs.std(axis=1)[:,None], -5.0, 5.0)
         logits = self.logits_net(obs)
         return Categorical(logits=logits)
-
+        
     def _log_prob_from_distribution(self, pi, act):
         return pi.log_prob(act)
     
-    def _d_kl(self, obs, old_mu, old_log_std, device):
-        raise NotImplementedError
+    def _d_kl(self, obs, old_logits, device):
+        logits = self.logits_net(obs)
+        tmp_cat = Categorical(logits=logits)
+        all_kls = (torch.exp(old_logits) * (old_logits - tmp_cat.logits)).sum(axis=1)
+        # import ipdb; ipdb.set_trace()
+        return all_kls.mean()
+        
+        
 
 class MLPGaussianActor(Actor):
 
@@ -121,6 +132,7 @@ class MLPGaussianActor(Actor):
         return d_kl
 
 
+
 class MLPCritic(nn.Module):
 
     def __init__(self, obs_dim, hidden_sizes, activation):
@@ -129,7 +141,6 @@ class MLPCritic(nn.Module):
 
     def forward(self, obs):
         return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
-
 
 
 class MLPActorCritic(nn.Module):
@@ -149,7 +160,7 @@ class MLPActorCritic(nn.Module):
             self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation).to(self.device)
 
         # build value function
-        self.v  = MLPCritic(obs_dim, hidden_sizes, activation).to(self.device)
+        self.v = MLPCritic(obs_dim, hidden_sizes, activation).to(self.device)
 
     def step(self, obs):
         with torch.no_grad():
@@ -158,7 +169,10 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy(), pi.mean.cpu().numpy(), torch.log(pi.stddev).cpu().numpy()
+        if isinstance(pi, Normal):
+            return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy(), pi.mean.cpu().numpy(), torch.log(pi.stddev).cpu().numpy()
+        elif isinstance(pi, Categorical):
+            return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy(), pi.logits.cpu().numpy()
 
     def act(self, obs):
         return self.step(obs)[0]
