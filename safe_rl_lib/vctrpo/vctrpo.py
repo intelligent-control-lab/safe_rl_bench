@@ -389,7 +389,35 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         ent = pi.entropy().mean().item()
         pi_info = dict(kl=approx_kl, ent=ent)
         
-        return loss_pi, pi_info
+        # infty norm of mu_0 (choose the mu_0 of the first trajectory)
+        norm_mu_0 = torch.norm(mu[0], p=np.inf)        
+        # L(s,a,s') estimate ( L=γA(s')-A(s)-γE[A(s_1)] )
+        mean_A_s1 = adv[start_idx+1].mean() #number
+        gammaA1_sub_A0 = gamma*adv[start_idx+1] - adv[start_idx] #vector
+        L = gammaA1_sub_A0 - mean_A_s1*gamma
+        # compute the KL related offset (substitute max DKL with expectation of DKL)
+        kl_div = abs((logp_old - logp).mean().item())
+        # estimate the epsilon, max_{s,a}A
+        epsilon = max(disc_adv)
+        # compute the H_max
+        bias = 4*(1+gamma)*gamma*kl_div*epsilon/(1-gamma)**2
+        H_max = abs(L) + bias
+        # mean variance function surrogate
+        omage_diff = max(abs(tmp_1 + tmp_2*H_max + H_max**2))
+        real_mean_var_surr = norm_mu_0*omage_diff / (1-gamma**2)
+        
+        # maximum eta ratio:
+        L_ = disc_adv[start_idx]
+        bias_ = bias/(1+gamma)
+        eta_max = abs(L_) + bias_
+        # variance mean function surrogate
+        tmp_3 = val[start_idx]
+        V_square_diff = max(abs(eta_max**2 + 2*tmp_3*eta_max))
+        real_var_mean_surr = norm_mu_0*V_square_diff - abs(min_J_square)
+        
+        chebyshev_surr = (mean_surr - k*(real_mean_var_surr + real_var_mean_surr))
+        
+        return loss_pi, pi_info, chebyshev_surr
 
     # Set up function for computing value loss
     def compute_loss_v(data):
@@ -406,13 +434,13 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def update():
         data = buf.get()
 
-        pi_l_old, pi_info_old = compute_loss_pi_Chebyshev(data, ac.pi)
+        pi_l_old, pi_info_old, pi_cheb_old = compute_loss_pi_Chebyshev(data, ac.pi)
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
 
         # TRPO policy update core impelmentation 
-        loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi)
+        loss_pi, pi_info, _ = compute_loss_pi_Chebyshev(data, ac.pi)
         g = auto_grad(loss_pi, ac.pi) # get the flatten gradient evaluted at pi old 
         kl_div = compute_kl_pi(data, ac.pi)
         Hx = lambda x: auto_hession_x(kl_div, ac.pi, torch.FloatTensor(x).to(device))
@@ -429,20 +457,24 @@ def trpo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             new_param = get_net_param_np_vec(ac.pi) - step * x_direction
             assign_net_param_from_flat(new_param, actor_tmp)
             kl = compute_kl_pi(data, actor_tmp)
-            pi_l, _ = compute_loss_pi_Chebyshev(data, actor_tmp)
+            _, _, pi_cheb = compute_loss_pi_Chebyshev(data, actor_tmp)
             
-            return kl, pi_l
+            return kl, pi_cheb
         
         # update the policy such that the KL diveragence constraints are satisfied and loss is decreasing
         for j in range(backtrack_iters):
-            kl, pi_l_new = set_and_eval(backtrack_coeff**j)
+            try:
+                kl, pi_l_new = set_and_eval(backtrack_coeff**j)
+            except:
+                import ipdb; ipdb.set_trace()
             
             if (kl.item() <= target_kl and pi_l_new.item() <= pi_l_old):
+                print(pi_l_new.item(), pi_l_old)
                 print(colorize(f'Accepting new params at step %d of line search.'%j, 'green', bold=False))
                 # update the policy parameter 
                 new_param = get_net_param_np_vec(ac.pi) - backtrack_coeff**j * x_direction
                 assign_net_param_from_flat(new_param, ac.pi)
-                loss_pi, pi_info = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
+                loss_pi, pi_info, pi_cheb = compute_loss_pi_Chebyshev(data, ac.pi) # re-evaluate the pi_info for the new policy
                 break
             if j==backtrack_iters-1:
                 print(colorize(f'Line search failed! Keeping old params.', 'yellow', bold=False))
